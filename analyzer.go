@@ -457,8 +457,6 @@ func RunAnalyzer() {
 	updateInterval := 300 * time.Millisecond
 	lastUpdate := time.Now().Add(-updateInterval)
 
-	fmt.Printf("%sDeep RTT profiling: %d workers, %d pings/proxy...%s\n\n", Cyan, workers, maxPings, Reset)
-
 	for r := range results {
 		if completed == 0 {
 			hbCancel()
