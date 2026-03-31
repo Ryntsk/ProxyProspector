@@ -1,12 +1,12 @@
-package executive
-
 // Package executive implements an aggressive proxy scoring engine
 // for selecting the best-performing MTProto proxies.
 //
-// It reads pre-measured proxy statistics from JSON, applies
-// a sophisticated scoring algorithm focused on real-world latency
-// stability and DPI resistance, ranks the proxies, and outputs
-// the top results both to console and clipboard (Windows only).
+// It loads pre-measured proxy statistics from JSON, applies a sophisticated
+// scoring algorithm focused on real-world latency stability and DPI resistance,
+// ranks the proxies, and outputs the top results both to console and clipboard
+// (Windows only).
+package executive
+
 import (
 	"encoding/json"
 	"fmt"
@@ -25,9 +25,12 @@ const (
 	// outputTop is the path where the fully ranked proxy list is saved.
 	outputTop = "json/top_proxies.json"
 
-	// topN defines how many best proxies are shown in the console
-	// and copied to the clipboard.
-	topN = 10
+	// topN defines how many best proxies are shown in the console.
+	topN = 20
+
+	// topClipboard defines how many best proxies are copied to the clipboard.
+	// (Reduced from console output to keep clipboard clean and compact.)
+	topClipboard = 10
 )
 
 //
@@ -207,16 +210,17 @@ func printTopN(proxies []ScoredProxy) {
 	}
 }
 
-// buildPlainText generates a plain-text list of the top proxies
-// (with Russian timestamp for the target audience) suitable for clipboard.
+// buildPlainText generates a clean plain-text list of the top proxies
+// suitable for clipboard (Windows). All text is in English to avoid
+// any encoding/charset issues on non-Russian systems.
 func buildPlainText(list []ScoredProxy) string {
 	var b strings.Builder
 
 	now := time.Now().Format("02.01.2006 15:04:05")
 
-	b.WriteString(fmt.Sprintf("Проверены %s\n\n", now))
+	b.WriteString(fmt.Sprintf("Checked %s\n\n", now))
 
-	for i := 0; i < topN && i < len(list); i++ {
+	for i := 0; i < topClipboard && i < len(list); i++ {
 		b.WriteString(fmt.Sprintf("%d. %s\n", i+1, list[i].TGLink()))
 	}
 
@@ -241,7 +245,7 @@ func copyToClipboard(text string) {
 
 // RunScorer is the main function of the scoring pipeline.
 // It loads proxies, scores them, sorts, saves JSON, prints results,
-// and copies the top list to the clipboard.
+// and copies the top list (top 10) to the clipboard.
 func RunScorer() {
 	raw, err := os.ReadFile(scorerInput)
 	if err != nil {
