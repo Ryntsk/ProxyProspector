@@ -1,16 +1,17 @@
-package executive
-
 // Package executive implements a high-performance MTProto proxy fetcher.
 //
-// It reads a list of public sources (sources.txt), downloads them in parallel,
-// parses Telegram proxy deep links, validates MTProto secrets (including
-// FakeTLS "ee" and "dd" prefixes), filters out suspicious or malformed entries,
-// deduplicates everything globally, and saves two clean JSON files:
-//   • proxies_tg.json      — valid, ready-to-use proxies
-//   • proxies_rejected.json — everything that was filtered out
+// It reads public proxy list sources from sources.txt, downloads them in parallel,
+// parses Telegram proxy deep links, validates MTProto secrets (including FakeTLS
+// "ee" and "dd" prefixes), filters out suspicious or malformed entries,
+// performs global deduplication, and produces two clean JSON files:
 //
-// The fetcher is designed for continuous, unattended operation and
-// produces clean, production-ready proxy lists for the scoring pipeline.
+//   • proxies_tg.json      — fully validated, production-ready proxies
+//   • proxies_rejected.json — everything that failed validation or parsing
+//
+// The fetcher is built for continuous, unattended operation and feeds clean data
+// directly into the downstream scoring pipeline.
+package executive
+
 import (
 	"bufio"
 	"encoding/hex"
@@ -26,7 +27,7 @@ import (
 )
 
 const (
-	// sourcesFile contains one URL per line with public proxy lists.
+	// sourcesFile contains one URL per line pointing to public proxy lists.
 	sourcesFile = "sources.txt"
 
 	// outputRejected stores all proxies that failed validation or parsing.
@@ -36,12 +37,15 @@ const (
 )
 
 var (
+	// httpClient is a shared client with a reasonable timeout for fetching
+	// potentially large proxy lists from multiple sources.
 	httpClient = &http.Client{Timeout: 15 * time.Second}
 
-	// Regex patterns for extracting proxy components from raw text lines.
+	// Regex patterns used to extract proxy components from raw text lines.
+	// These patterns are tuned for the most common Telegram deep-link formats.
 	serverRegex = regexp.MustCompile(`server=([0-9A-Za-z.\-_]+)`)
 	portRegex   = regexp.MustCompile(`port=([0-9]+)`)
-	secretRegex = regexp.MustCompile(`secret\s*=\s*([0-9a-fA-F]{16,})`)
+	secretRegex = regexp.MustCompile(`secret\s*=\s*([0-9a-zA-Z+/=_-]+)`)
 )
 
 // ProxyEntry represents a single MTProto proxy (server:port:secret).
@@ -51,16 +55,16 @@ type ProxyEntry struct {
 	Secret string `json:"secret"`
 }
 
-// key returns a unique identifier for deduplication.
+// key returns a unique identifier for global deduplication.
 func (p ProxyEntry) key() string {
 	return p.Server + ":" + p.Port + ":" + p.Secret
 }
 
 // sourceResult holds the outcome of scanning one source URL.
 type sourceResult struct {
-	scanned int               // total non-empty lines processed
-	tgRaw   []ProxyEntry      // valid proxies
-	rejRaw  []ProxyEntry      // rejected or malformed entries
+	scanned int          // total non-empty lines processed
+	tgRaw   []ProxyEntry // valid proxies
+	rejRaw  []ProxyEntry // rejected or malformed entries
 }
 
 //
@@ -73,13 +77,13 @@ func fetchSource(rawURL string) sourceResult {
 
 	resp, err := httpClient.Get(rawURL)
 	if err != nil {
-		log.Printf("Ошибка загрузки [%s]: %v\n", rawURL, err)
+		log.Printf("Error downloading [%s]: %v\n", rawURL, err)
 		return res
 	}
 	defer resp.Body.Close()
 
 	sc := bufio.NewScanner(resp.Body)
-	// Large buffer to handle big proxy lists efficiently
+	// Large buffer to handle big proxy lists efficiently.
 	buf := make([]byte, 0, 1024*1024)
 	sc.Buffer(buf, 1024*1024)
 
@@ -117,8 +121,7 @@ func parseProxyLine(line string, res *sourceResult) {
 		return
 	}
 
-	// Normalize secret early so deduplication works correctly
-	// and secretType detection later is consistent.
+	// Normalize secret early so deduplication and validation are consistent.
 	secret := strings.ToLower(strings.ReplaceAll(scm[1], " ", ""))
 
 	entry := ProxyEntry{Server: server, Port: port, Secret: secret}
@@ -164,7 +167,7 @@ func isValidMTProtoSecret(secret string) bool {
 	case 16:
 		return true
 	default:
-		// ee/dd prefixes are allowed for extended (FakeTLS) secrets
+		// ee/dd prefixes are allowed for extended (FakeTLS) secrets.
 		prefix := secret[:2]
 		if prefix == "dd" || prefix == "ee" {
 			return len(decoded) >= 17
@@ -176,40 +179,45 @@ func isValidMTProtoSecret(secret string) bool {
 // isSuspiciousSecret applies several heuristics to detect low-quality
 // or fake secrets that are likely to be blocked or perform poorly.
 func isSuspiciousSecret(secret string) bool {
-	// Remove known valid prefixes for analysis of the payload
 	cleanSecret := secret
+	// Remove FakeTLS prefixes for key analysis.
 	if strings.HasPrefix(secret, "ee") || strings.HasPrefix(secret, "dd") {
 		cleanSecret = secret[2:]
 	}
 
+	// If the secret (after prefix removal) is shorter than 32 characters,
+	// it is already invalid for MTProto.
 	if len(cleanSecret) < 32 {
-		return false // too short for meaningful pattern analysis
+		return false
 	}
 
-	// Detect known FakeTLS header patterns that are not truly random
-	if strings.HasPrefix(secret, "ee1603") {
-		if strings.Contains(secret, "00010001") || strings.Contains(secret, "030386e2") {
+	// We only inspect the first 32 hex characters (the real key part).
+	keyPart := cleanSecret[:32]
+
+	// 1. Known low-quality TLS handshake patterns.
+	if strings.HasPrefix(keyPart, "1603") {
+		if strings.Contains(keyPart, "00010001") || strings.Contains(keyPart, "0303") {
 			return true
 		}
 	}
 
-	// Reject secrets with long runs of identical hex characters
-	// (cryptographically random data almost never has 8+ repeats)
-	if containsLongRepeats(cleanSecret, 8) {
+	// 2. Long runs of identical characters.
+	if containsLongRepeats(keyPart, 8) {
 		return true
 	}
 
-	// Frequency analysis: if any single character dominates (>40%),
-	// the secret is almost certainly not random.
+	// 3. Frequency analysis – a cryptographic key should have high entropy.
 	counts := make(map[rune]int)
 	maxRepeat := 0
-	for _, char := range cleanSecret {
+	for _, char := range keyPart {
 		counts[char]++
 		if counts[char] > maxRepeat {
 			maxRepeat = counts[char]
 		}
 	}
-	if float64(maxRepeat)/float64(len(cleanSecret)) > 0.4 {
+
+	// More than 40% of the same character is highly suspicious.
+	if float64(maxRepeat)/float64(len(keyPart)) > 0.4 {
 		return true
 	}
 
@@ -264,7 +272,7 @@ func dedup(list []ProxyEntry) []ProxyEntry {
 func readURLs(filename string) ([]string, error) {
 	file, err := os.Open(filename)
 	if err != nil {
-		return nil, fmt.Errorf("не удалось открыть %s: %w", filename, err)
+		return nil, fmt.Errorf("failed to open %s: %w", filename, err)
 	}
 	defer file.Close()
 
@@ -297,18 +305,18 @@ func saveJSON(filename string, list []ProxyEntry) {
 //
 
 // RunFetcher orchestrates the entire fetching pipeline:
-//   1. Reads source URLs
+//   1. Reads source URLs from sources.txt
 //   2. Downloads and parses them concurrently
 //   3. Prints per-source statistics
-//   4. Globally deduplicates and saves results
+//   4. Performs global deduplication and saves the final JSON files
 func RunFetcher() {
 	urls, err := readURLs(sourcesFile)
 	if err != nil {
-		fmt.Printf("Ошибка чтения источников: %v\n", err)
+		fmt.Printf("Error reading sources: %v\n", err)
 		return
 	}
 	if len(urls) == 0 {
-		fmt.Println("Файл источников пуст или не содержит валидных ссылок.")
+		fmt.Println("Sources file is empty or contains no valid links.")
 		return
 	}
 
@@ -336,7 +344,7 @@ func RunFetcher() {
 		totalRaw = append(totalRaw, res.rejRaw...)
 		totalDedup := dedup(totalRaw)
 
-		fmt.Printf("%s\n└──Total = %d, unic = %d, rejected = %d, correct = %d\n\n",
+		fmt.Printf("%s\n└── Scanned: %d | Unique: %d | Rejected: %d | Valid: %d\n\n",
 			u, res.scanned, len(totalDedup), len(rejDedup), len(tgDedup))
 	}
 
@@ -353,5 +361,5 @@ func RunFetcher() {
 	saveJSON(outputTG, allTg)
 	saveJSON(outputRejected, allRejected)
 
-	fmt.Printf("Collected: %d\n", len(allTg))
+	fmt.Printf("Collected %d valid MTProto proxies\n", len(allTg))
 }
